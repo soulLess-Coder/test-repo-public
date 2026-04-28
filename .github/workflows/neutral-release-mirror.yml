@@ -70,13 +70,8 @@ jobs:
       - name: Download Copybara
         if: steps.copybara-cache.outputs.cache-hit != 'true'
         run: |
-          # TODO: Replace this URL with a real Copybara release before first run.
-          # Browse https://github.com/google/copybara/releases and copy a recent tag.
-          # Example (please update):
-          #   curl -fsSL -o copybara_deploy.jar \
-          #     https://github.com/google/copybara/releases/download/v0.0.0-XXXXXXXX/copybara_deploy.jar
-          echo "ERROR: Pin a real Copybara version. See the comment in this step." >&2
-          exit 1
+          curl -fsSL -o copybara_deploy.jar \
+            https://github.com/google/copybara/releases/download/v20260420/copybara_deploy.jar
 
       - name: Render copy.bara.sky from dispatch payload
         env:
