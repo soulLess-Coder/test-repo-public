@@ -8,4 +8,5 @@ function hello(name = "world") {
 
 console.log('Hello');
 console.log('Hey');
+console.log('HI');
 module.exports = { hello };
