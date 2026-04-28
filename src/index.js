@@ -6,4 +6,5 @@ function hello(name = "world") {
   return `Hello, ${name}!`;
 }
 
+console.log('Hello');
 module.exports = { hello };
