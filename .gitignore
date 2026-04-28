@@ -6,9 +6,3 @@ node_modules/
 .DS_Store
 .env.local
 .env*.local
-
-# Build artifacts emitted by the GitHub Actions workflow
-copybara_deploy.jar
-cb-out/
-publish.json
-copybara.log

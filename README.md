@@ -1,116 +1,159 @@
-# test-repo-public
+# test-repo-internal
 
-The **public mirror** side of a `neutral-release` end-to-end test. Push
-this directory to a *public* GitHub repo named `test-repo-public` (or
-whatever `externalRepo` you registered in `../test-repo-internal/`'s
-`release:register` call).
+The **private** side of a `neutral-release` end-to-end test, plus the
+**Convex deployment that hosts the orchestrator**. Two things live here:
+
+1. The npm package `@release-test/repo` — `src/index.js` is the source,
+   `package.json` is the manifest. This is what gets mirrored to
+   `test-repo-public` and (eventually) published to npm.
+2. A Convex project — `convex/` mounts the `neutral-release` component,
+   exposes the GitHub-push webhook, and the worker callback endpoint.
 
 ```
-test-repo-public/
-├── package.json                       # @release-test/repo-public; thin Convex project
-├── convex.json
+test-repo-internal/
+├── package.json                       # both: npm manifest + workspace root
+├── convex.json                        # Convex project config
 ├── tsconfig.json
-├── README.md (this file)
+├── README.md
 ├── .gitignore
-├── convex/
-│   └── schema.ts                      # empty; here so this IS a Convex project
-├── .github/
-│   └── workflows/
-│       └── neutral-release-mirror.yml # fires on repository_dispatch
-└── scripts/
-    └── neutral-release-callback.sh    # HMAC-signs the worker callback
+├── convex/                            # the orchestrator host (this Convex deployment)
+│   ├── convex.config.ts               # registers neutral-release component
+│   ├── schema.ts                      # empty (component owns its own tables)
+│   ├── http.ts                        # mounts /webhooks/{github/push,release/callback}
+│   └── release.ts                     # CLI driver wrappers
+├── packages/
+│   └── neutral-release/               # the component itself (workspace pkg)
+└── src/
+    └── index.js                       # the actual @release-test/repo source
 ```
 
-## How this connects to the orchestrator
+## How this differs from a real-world setup
 
-The orchestrator (the `neutral-release` component) lives in
-`../test-repo-internal/` and listens on a Convex deployment hosted from
-that project's `convex/` folder. The flow:
+In production, the Convex deployment hosting `neutral-release` is its
+own separate project — not the same as the source repo being mirrored.
+Here we colocate them in one repo for testing convenience. The
+`transformConfig` set up by `release:register` excludes `convex/`,
+`packages/`, `package.json`, and the various lockfiles from the mirror,
+so only `src/` lands in `test-repo-public`.
 
-1. Someone calls `release:dispatch` on the **internal** Convex
-   deployment with a `versionId`.
-2. That action POSTs `repository_dispatch` to **this** GitHub repo with
-   `event_type: neutral-release-mirror` and a fully-rendered Copybara
-   config in the payload.
-3. `.github/workflows/neutral-release-mirror.yml` runs, mirrors via
-   Copybara, builds, runs `npm publish --dry-run`, then runs
-   `scripts/neutral-release-callback.sh`, which HMAC-signs and POSTs
-   results to `<internal-deployment>.convex.site/webhooks/release/callback`.
-4. That callback inserts a `releases` row, flips the `versions` row to
-   `published`, and patches each commit's `externalSha`.
+## End-to-end testing flow
 
-This repo's own `convex/` directory is intentionally minimal — it
-exists so the project IS a Convex project (parity with internal), not
-because Phase 3 needs anything Convex-side here.
+This is the abbreviated version; the full story (with troubleshooting)
+is in `../test-repo-public/README.md` plus the comments in
+`convex/release.ts`.
 
-## Setup steps
-
-### 1. Push to a public GitHub repo
+### Round 1 — verify ingestion
 
 ```bash
-bun install            # installs the convex CLI, etc.
-git init && git add -A && git commit -m "chore: bootstrap with neutral-release workflow"
+# Generate two HMAC secrets (save them somewhere)
+PUSH_SECRET=$(openssl rand -hex 32)
+CALLBACK_SECRET=$(openssl rand -hex 32)
+
+# Install + bring Convex online (also regenerates _generated/)
+bun install
+bunx convex dev      # leave running in another terminal
+
+# Register this repo. Replace placeholders with your GitHub user/org.
+bunx convex run release:register '{
+  "pushSecret":     "<PUSH_SECRET>",
+  "callbackSecret": "<CALLBACK_SECRET>",
+  "internalRepo":   "<you>/test-repo-internal",
+  "externalRepo":   "<you>/test-repo-public"
+}'
+# → returned repoId (e.g. "10001;repos") — copy it
+
+# Push this directory to GitHub:
+git init && git add -A && git commit -m "chore: initial commit"
 git branch -M main
-git remote add origin git@github.com:<you>/test-repo-public.git
+git remote add origin git@github.com:<you>/test-repo-internal.git
 git push -u origin main
+
+# Configure the webhook on the GitHub repo:
+#   Settings → Webhooks → Add webhook
+#   URL: https://<deployment>.convex.site/webhooks/github/push
+#   Content type: application/json
+#   Secret: <PUSH_SECRET>   (same value)
+#   Events: just push events
+
+# Push a real commit and verify it lands:
+echo "console.log('hi');" >> src/index.js
+git commit -am "feat(greeter): add log
+
+Version-Bump: minor"
+git push
+
+bunx convex run release:listCommits '{
+  "repoId":"<REPO_ID>","branchName":"main","limit":10
+}' | jq .
 ```
 
-### 2. Create a deploy key for Copybara to clone the internal repo
+### Round 2 — verify planning
 
 ```bash
-ssh-keygen -t ed25519 -C neutral-release-mirror -f /tmp/release-test-key -N ""
+bunx convex run release:baseline '{
+  "repoId":"<REPO_ID>","semver":"0.0.0","atCommitSha":"0000000","atTime":0
+}'
+bunx convex run release:preview '{"repoId":"<REPO_ID>"}' | jq .
+bunx convex run release:plan    '{"repoId":"<REPO_ID>"}'
+# → versionId, e.g. "10042;versions"
 ```
 
-- `/tmp/release-test-key.pub` (public half) → `<you>/test-repo-internal`'s
-  Settings → Deploy keys → **read-only**.
-- `/tmp/release-test-key` (private half) → this repo's
-  Settings → Secrets → Actions → `INTERNAL_REPO_SSH_KEY`.
+### Round 3 — full pipeline (dry-run npm)
 
-### 3. Set the Actions secrets on this repo
-
-Settings → Secrets and variables → Actions:
-
-| Secret | Value |
-| --- | --- |
-| `INTERNAL_REPO_SSH_KEY` | The private half of the deploy key from step 2 |
-| `NEUTRAL_RELEASE_CALLBACK_SECRET` | Same as `repos.workerCallbackSecret` you passed to `release:register` |
-| `NPM_TOKEN` | Any non-empty string for dry-run; a real automation token for real publish |
-
-`GITHUB_TOKEN` is provided automatically.
-
-### 4. Pin a real Copybara version
-
-Edit `.github/workflows/neutral-release-mirror.yml` → "Download Copybara"
-step. The placeholder URL there `exit 1`s on purpose so you don't
-silently run with no Copybara. Browse
-https://github.com/google/copybara/releases, pick a recent tag, and
-replace the curl command with a working URL.
-
-### 5. (On the internal side) configure the GitHub PAT
-
-In `../test-repo-internal/`:
+See `../test-repo-public/README.md` for the workflow setup, secrets,
+and Copybara pinning. Then back here:
 
 ```bash
 bunx convex env set NEUTRAL_RELEASE_GITHUB_TOKEN <ghp_token>
+bunx convex run release:dispatch '{"versionId":"<VERSION_ID>"}'
+bunx convex run release:listRuns '{"repoId":"<REPO_ID>"}' | jq .
 ```
 
-The PAT needs `actions: write` and `contents: read` scoped to **this**
-public repo so `dispatchMirrorRun` can POST `repository_dispatch`.
+## Driver reference
 
-## Common gotchas (Phase 3)
+All wrappers live in `convex/release.ts`:
 
-| Symptom | Cause |
+| Wrapper | Calls component function |
 | --- | --- |
-| Workflow won't start at all | PAT lacks `actions: write` or `externalRepo` is misspelled |
-| Workflow says "Permission denied (publickey)" cloning internal | `INTERNAL_REPO_SSH_KEY` missing or contains the public half |
-| Copybara: "Cannot find any change to migrate" | First run; add `--init-history` to the Run Copybara step temporarily |
-| Callback returns 401 | `NEUTRAL_RELEASE_CALLBACK_SECRET` doesn't match `workerCallbackSecret` in Convex |
-| Callback returns 400 with `CALLBACK_MISSING_FIELDS` | Workflow's publish step didn't set tarball/integrity outputs (likely an earlier step failed) |
+| `release:register` | `repos.registerRepo` |
+| `release:getRepo` / `listRepos` | `repos.getRepo` / `listRepos` |
+| `release:baseline` | `versions.setBaselineVersion` |
+| `release:preview` | `versions.previewRelease` |
+| `release:plan` | `versions.planRelease` |
+| `release:dispatch` | `worker.dispatchMirrorRun` |
+| `release:cancel` | `worker.cancelMirrorRun` |
+| `release:listRuns` | `worker.listMirrorRunsForRepo` |
+| `release:getCommit` / `listCommits` | `commits.getCommit` / `listCommitsForBranch` |
 
-## Going to real npm publish
+## Commit message conventions
 
-In `.github/workflows/neutral-release-mirror.yml`'s "Publish to npm"
-step, drop `--dry-run`. Set a real automation `NPM_TOKEN`. Adjust the
-package name in `package.json` (or override `publicPackage` when
-calling `release:register`) to something you actually control. The
-flow is otherwise identical.
+The component parses [Conventional Commits] plus four custom trailers:
+`Mirror-Visibility`, `Mirror-Strategy`, `Version-Bump`, `Release-Notes`.
+
+```
+feat(greeter): add a console.log
+fix: handle null name
+feat!: drop legacy API
+chore: lockfile
+
+# With explicit policy:
+feat(greeter): add a flag
+
+Mirror-Visibility: public
+Version-Bump: minor
+Release-Notes: Adds a flag for verbose output.
+```
+
+Pushes to off-allowlist branches (anything not in `mirroredBranches`)
+are recorded but forced to `derivedMirrorVisibility: "private"` and
+won't shape any public release.
+
+## Component tests
+
+The neutral-release component ships its own test suite:
+
+```bash
+cd packages/neutral-release && bun run test    # 108 tests
+```
+
+[Conventional Commits]: https://www.conventionalcommits.org/
