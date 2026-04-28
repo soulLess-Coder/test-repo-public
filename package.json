@@ -1,0 +1,21 @@
+{
+  "name": "@release-test/repo-public",
+  "version": "0.0.0",
+  "description": "neutral-release end-to-end test fixture (public mirror side). Receives repository_dispatch from Convex, runs Copybara, calls back.",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "dev": "convex dev"
+  },
+  "dependencies": {
+    "convex": "1.33.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.11",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT"
+}

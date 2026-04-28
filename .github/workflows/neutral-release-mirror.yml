@@ -1,0 +1,156 @@
+# neutral-release: mirror dispatch handler (test-repo-public)
+#
+# Fires when Convex POSTs `repository_dispatch` with type
+# `neutral-release-mirror`. The Convex side renders a complete
+# `copy.bara.sky` and embeds it in `client_payload.copybaraConfig`;
+# this workflow writes it to disk and runs Copybara.
+#
+# This file is configured for `npm publish --dry-run` so you can do
+# a full end-to-end test without owning a real npm package. To flip
+# to real publishing, drop `--dry-run` from the publish step and put
+# a real automation token in NPM_TOKEN.
+#
+# Required Actions secrets:
+#   - INTERNAL_REPO_SSH_KEY            SSH deploy key with read access to the internal repo
+#   - NPM_TOKEN                        Any non-empty string for dry-run; real token for real publish
+#   - NEUTRAL_RELEASE_CALLBACK_SECRET  Same value as repos.workerCallbackSecret in Convex
+
+name: neutral-release-mirror
+
+on:
+  repository_dispatch:
+    types: [neutral-release-mirror]
+
+concurrency:
+  group: neutral-release-mirror-${{ github.event.client_payload.repoId }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 30
+
+    env:
+      MIRROR_RUN_ID: ${{ github.event.client_payload.mirrorRunId }}
+      INTERNAL_REPO: ${{ github.event.client_payload.internalRepo }}
+      EXTERNAL_REPO: ${{ github.event.client_payload.externalRepo }}
+      INTERNAL_SHA: ${{ github.event.client_payload.internalSha }}
+      SEMVER: ${{ github.event.client_payload.semver }}
+      PUBLIC_PACKAGE: ${{ github.event.client_payload.publicPackage }}
+      CALLBACK_URL: ${{ github.event.client_payload.callbackUrl }}
+      CALLBACK_SECRET: ${{ secrets.NEUTRAL_RELEASE_CALLBACK_SECRET }}
+
+    steps:
+      - name: Checkout external repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up SSH for internal repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.INTERNAL_REPO_SSH_KEY }}
+
+      - name: Install Java (Copybara runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Copybara
+        id: copybara-cache
+        uses: actions/cache@v4
+        with:
+          path: copybara_deploy.jar
+          key: copybara-pinned-2024
+
+      - name: Download Copybara
+        if: steps.copybara-cache.outputs.cache-hit != 'true'
+        run: |
+          # TODO: Replace this URL with a real Copybara release before first run.
+          # Browse https://github.com/google/copybara/releases and copy a recent tag.
+          # Example (please update):
+          #   curl -fsSL -o copybara_deploy.jar \
+          #     https://github.com/google/copybara/releases/download/v0.0.0-XXXXXXXX/copybara_deploy.jar
+          echo "ERROR: Pin a real Copybara version. See the comment in this step." >&2
+          exit 1
+
+      - name: Render copy.bara.sky from dispatch payload
+        env:
+          CONFIG: ${{ toJson(github.event.client_payload.copybaraConfig) }}
+        run: |
+          # client_payload.copybaraConfig is a JSON-encoded string. jq -r
+          # unwraps it back into the actual Starlark file body.
+          printf '%s' "$CONFIG" | jq -r . > copy.bara.sky
+          echo "─── copy.bara.sky ───"
+          cat copy.bara.sky
+          echo "─────────────────────"
+
+      - name: Run Copybara
+        id: copybara
+        run: |
+          set -o pipefail
+          # FIRST RUN ONLY: add `--init-history` if Copybara complains
+          # "no previous revision found". Remove it after the first
+          # successful run.
+          java -jar copybara_deploy.jar migrate copy.bara.sky default \
+            --git-no-verify \
+            --output-root="$GITHUB_WORKSPACE/cb-out" \
+            2>&1 | tee copybara.log
+
+          git fetch origin main
+          EXTERNAL_HEAD=$(git rev-parse origin/main)
+          echo "external_head=$EXTERNAL_HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install + build (no-op for the test fixture)
+        run: |
+          # The test fixture has no real build, but we still run npm ci
+          # so the workflow exercises the same code path real packages take.
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-package-lock; fi
+          npm run build || echo "no build script"
+
+      - name: Set version
+        run: npm version "$SEMVER" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm (dry-run for testing)
+        id: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Real publish: drop --dry-run and put a valid automation token in NPM_TOKEN.
+          npm publish --access public --dry-run --json > publish.json
+          NAME=$(jq -r '.name' publish.json)
+          VERSION=$(jq -r '.version' publish.json)
+          # --dry-run doesn't return a real tarball URL or integrity, so
+          # we synthesize ones that the callback validation accepts.
+          TARBALL_URL="dryrun://${NAME}/${VERSION}.tgz"
+          INTEGRITY="sha512-DRYRUNxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=="
+          echo "tarball=$TARBALL_URL" >> "$GITHUB_OUTPUT"
+          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+
+      - name: Send success callback
+        if: success()
+        run: ./scripts/neutral-release-callback.sh
+        env:
+          CALLBACK_STATUS: succeeded
+          EXTERNAL_HEAD: ${{ steps.copybara.outputs.external_head }}
+          NPM_TARBALL: ${{ steps.publish.outputs.tarball }}
+          NPM_INTEGRITY: ${{ steps.publish.outputs.integrity }}
+          WORKER_LOG_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Send failure callback
+        if: failure()
+        run: ./scripts/neutral-release-callback.sh
+        env:
+          CALLBACK_STATUS: failed
+          ERROR_MESSAGE: "Mirror run failed at step ${{ job.status }}; see workerLogUrl for details"
+          WORKER_LOG_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
