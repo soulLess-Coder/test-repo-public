@@ -54,10 +54,14 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.INTERNAL_REPO_SSH_KEY }}
 
-      - name: Configure git URL rewrites for Copybara auth
+      - name: Configure git for Copybara
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Identity for the commits Copybara writes onto the destination.
+          git config --global user.name "neutral-release"
+          git config --global user.email "release@neutralbase.invalid"
+
           # The rendered copy.bara.sky uses https:// URLs for both repos. We
           # rewrite them at the git layer so Copybara picks up the right
           # credentials without us having to touch the config:
