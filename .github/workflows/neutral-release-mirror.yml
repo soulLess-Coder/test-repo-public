@@ -107,10 +107,20 @@ jobs:
         id: copybara
         run: |
           set -o pipefail
-          # FIRST RUN ONLY: add `--init-history` if Copybara complains
-          # "no previous revision found". Remove it after the first
-          # successful run.
+          # Copybara tracks sync history by writing a `GitOrigin-RevId:`
+          # trailer to every commit it pushes. On the first run there is no
+          # such trailer in the destination, so we pass `--init-history`.
+          # Detect that automatically rather than requiring a manual flip.
+          if git log --all --grep='GitOrigin-RevId' --max-count=1 --pretty=format:%H | grep -q .; then
+            INIT_FLAG=""
+            echo "Found prior GitOrigin-RevId; running incremental migrate."
+          else
+            INIT_FLAG="--init-history"
+            echo "No prior GitOrigin-RevId; running first-time migrate with --init-history."
+          fi
+
           java -jar copybara_deploy.jar migrate copy.bara.sky default \
+            $INIT_FLAG \
             --git-no-verify \
             --output-root="$GITHUB_WORKSPACE/cb-out" \
             2>&1 | tee copybara.log
