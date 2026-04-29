@@ -9,6 +9,7 @@ function hello(name = "world") {
 console.log('Hello');
 console.log('Hey');
 console.log('HI');
+console.log('TestingOne');
 module.exports = { hello };
 
 //Dont include the comment
