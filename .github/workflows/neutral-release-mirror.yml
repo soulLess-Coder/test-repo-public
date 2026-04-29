@@ -1,0 +1,185 @@
+# neutral-release: mirror dispatch handler
+#
+# Drop this file at `.github/workflows/neutral-release-mirror.yml` in the
+# PUBLIC mirror repo (the one named in `repos.externalRepo`). It is invoked
+# by Convex via `repository_dispatch` whenever someone calls
+# `dispatchMirrorRun`.
+#
+# Required Actions secrets on this repo:
+#   - INTERNAL_REPO_SSH_KEY            SSH deploy key with read access to the internal repo
+#   - NPM_TOKEN                        Token with publish access to the public package
+#   - NEUTRAL_RELEASE_CALLBACK_SECRET  Same value as repos.workerCallbackSecret in Convex
+#
+# Inputs come from `client_payload` of the dispatch event:
+#   - mirrorRunId, repoId, versionId
+#   - internalRepo, externalRepo, internalSha, semver, publicPackage
+#   - copybaraConfig (full Starlark, written verbatim to copy.bara.sky)
+#   - callbackUrl (Convex /webhooks/release/callback URL)
+
+name: neutral-release-mirror
+
+on:
+  repository_dispatch:
+    types: [neutral-release-mirror]
+
+concurrency:
+  group: neutral-release-mirror-${{ github.event.client_payload.repoId }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 30
+
+    env:
+      MIRROR_RUN_ID: ${{ github.event.client_payload.mirrorRunId }}
+      INTERNAL_REPO: ${{ github.event.client_payload.internalRepo }}
+      EXTERNAL_REPO: ${{ github.event.client_payload.externalRepo }}
+      INTERNAL_SHA: ${{ github.event.client_payload.internalSha }}
+      SEMVER: ${{ github.event.client_payload.semver }}
+      PUBLIC_PACKAGE: ${{ github.event.client_payload.publicPackage }}
+      CALLBACK_URL: ${{ github.event.client_payload.callbackUrl }}
+      CALLBACK_SECRET: ${{ secrets.NEUTRAL_RELEASE_CALLBACK_SECRET }}
+
+    steps:
+      - name: Trap failures so the callback always fires
+        run: echo "TRAP_ARMED=1" >> "$GITHUB_ENV"
+
+      - name: Checkout external repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up SSH for internal repo
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.INTERNAL_REPO_SSH_KEY }}
+
+      - name: Configure git for Copybara
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Identity for the commits Copybara writes onto the destination.
+          git config --global user.name "neutral-release"
+          git config --global user.email "release@neutralbase.invalid"
+
+          # The rendered copy.bara.sky uses https:// URLs for both repos. We
+          # rewrite them at the git layer so Copybara's invocations pick up
+          # the right credentials without us having to touch the config:
+          #   - Origin (internal, private): use SSH via the deploy key the
+          #     ssh-agent step just loaded.
+          #   - Destination (public, this repo): use GITHUB_TOKEN over HTTPS.
+          git config --global "url.git@github.com:${INTERNAL_REPO}.git.insteadOf" \
+            "https://github.com/${INTERNAL_REPO}.git"
+          git config --global "url.https://x-access-token:${GH_TOKEN}@github.com/${EXTERNAL_REPO}.git.insteadOf" \
+            "https://github.com/${EXTERNAL_REPO}.git"
+          # Trust github.com's SSH host key so the fetch isn't blocked by
+          # the interactive "Are you sure you want to continue connecting?".
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Install Java (Copybara runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Copybara
+        id: copybara-cache
+        uses: actions/cache@v4
+        with:
+          path: copybara_deploy.jar
+          key: copybara-pinned-2024
+
+      - name: Download Copybara
+        if: steps.copybara-cache.outputs.cache-hit != 'true'
+        run: |
+          # Pinned to a known-good Copybara release. Update periodically.
+          curl -fsSL -o copybara_deploy.jar \
+            https://github.com/google/copybara/releases/download/v20260420/copybara_deploy.jar
+
+      - name: Render copy.bara.sky from dispatch payload
+        env:
+          CONFIG: ${{ toJson(github.event.client_payload.copybaraConfig) }}
+        run: |
+          # The payload already contains a fully-rendered Starlark file as a
+          # JSON string. jq -r unwraps the string into the actual file body.
+          printf '%s' "$CONFIG" | jq -r . > copy.bara.sky
+          echo "─── copy.bara.sky ───"
+          cat copy.bara.sky
+          echo "─────────────────────"
+
+      - name: Run Copybara
+        id: copybara
+        run: |
+          set -o pipefail
+          # Copybara tracks sync history by writing a `GitOrigin-RevId:`
+          # trailer to every commit it pushes. On the first run there is no
+          # such trailer in the destination, so we pass `--init-history`.
+          # Detect that automatically rather than requiring a manual flip.
+          if git log --all --grep='GitOrigin-RevId' --max-count=1 --pretty=format:%H | grep -q .; then
+            INIT_FLAG=""
+          else
+            INIT_FLAG="--init-history"
+          fi
+
+          java -jar copybara_deploy.jar migrate copy.bara.sky default \
+            $INIT_FLAG \
+            --git-no-verify \
+            --output-root="$GITHUB_WORKSPACE/cb-out" \
+            2>&1 | tee copybara.log
+          # Extract the external SHA(s) Copybara wrote. The simplest reliable
+          # source is `git log` on the destination after Copybara has pushed:
+          # we fetch the latest from origin and read its HEAD.
+          git fetch origin main
+          EXTERNAL_HEAD=$(git rev-parse origin/main)
+          echo "external_head=$EXTERNAL_HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build
+        run: |
+          # Adapt this to whatever the public repo needs. For neutral-cards
+          # the build is `npm ci && npm run build`.
+          npm ci
+          npm run build
+
+      - name: Set version
+        run: |
+          npm version "$SEMVER" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm
+        id: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public --json > publish.json
+          TARBALL_URL=$(jq -r '"https://registry.npmjs.org/\(.name)/-/\(.name | split("/") | last)-\(.version).tgz"' publish.json)
+          INTEGRITY=$(jq -r '.integrity' publish.json)
+          echo "tarball=$TARBALL_URL" >> "$GITHUB_OUTPUT"
+          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+
+      - name: Send success callback
+        if: success()
+        run: ./scripts/neutral-release-callback.sh
+        env:
+          CALLBACK_STATUS: succeeded
+          EXTERNAL_HEAD: ${{ steps.copybara.outputs.external_head }}
+          NPM_TARBALL: ${{ steps.publish.outputs.tarball }}
+          NPM_INTEGRITY: ${{ steps.publish.outputs.integrity }}
+          WORKER_LOG_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Send failure callback
+        if: failure()
+        run: ./scripts/neutral-release-callback.sh
+        env:
+          CALLBACK_STATUS: failed
+          ERROR_MESSAGE: "Mirror run failed at step ${{ job.status }}; see workerLogUrl for details"
+          WORKER_LOG_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
