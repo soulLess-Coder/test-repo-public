@@ -6,11 +6,7 @@ function hello(name = "world") {
   return `Hello, ${name}!`;
 }
 
-console.log('Hello');
-console.log('Hey');
-console.log('HI');
-console.log('TestingOne');
-console.log('TestingTwo');
+console.log('First Commit- Public');
 
 module.exports = { hello };
 
