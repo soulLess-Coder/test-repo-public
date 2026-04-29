@@ -10,6 +10,8 @@ console.log('Hello');
 console.log('Hey');
 console.log('HI');
 console.log('TestingOne');
+console.log('TestingTwo');
+
 module.exports = { hello };
 
 //Dont include the comment
