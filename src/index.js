@@ -8,6 +8,7 @@ function hello(name = "world") {
 
 console.log('First Commit- Public');
 console.log('Second Commit- Private');
+console.log('Third Commit - Public');
 
 module.exports = { hello };
 
