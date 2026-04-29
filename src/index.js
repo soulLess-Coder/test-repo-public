@@ -7,6 +7,7 @@ function hello(name = "world") {
 }
 
 console.log('First Commit- Public');
+console.log('Second Commit- Private');
 
 module.exports = { hello };
 
