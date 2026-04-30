@@ -7,6 +7,7 @@ function hello(name = "world") {
 }
 
 console('1st Commit');
+console('2nd Commit');
 
 module.exports = { hello };
 
