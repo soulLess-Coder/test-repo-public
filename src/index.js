@@ -6,9 +6,7 @@ function hello(name = "world") {
   return `Hello, ${name}!`;
 }
 
-console.log('First Commit- Public');
-console.log('Second Commit- Private');
-console.log('Third Commit - Public');
+console('1st Commit');
 
 module.exports = { hello };
 
