@@ -8,7 +8,7 @@ function hello(name = "world") {
 
 console('1st Commit');
 console('2nd Commit');
-
+console('3rd Commit');
 module.exports = { hello };
 
 //Dont include the comment
